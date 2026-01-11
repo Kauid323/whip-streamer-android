@@ -48,6 +48,10 @@ class StreamService : Service() {
     private var eglBase: EglBase? = null
     private var sharedMediaProjection: MediaProjection? = null
 
+    private var currentVideoBitrateKbps: Int = 2500
+    private var currentVideoFps: Int = 30
+    private var currentAudioBitrateKbps: Int = 64
+
     private val systemAudioFactoryInvokedOnce = AtomicBoolean(false)
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
@@ -55,6 +59,88 @@ class StreamService : Service() {
     
     // Prevent double stop
     private var isStopping = false
+
+    private fun applySenderBitrates(videoBitrateKbps: Int, videoFps: Int, audioBitrateKbps: Int) {
+        val pc = peerConnection ?: return
+
+        fun applyToSender(sender: RtpSender, kind: String) {
+            try {
+                val p = sender.parameters
+                val enc = p.encodings
+                if (enc.isNullOrEmpty()) {
+                    Log.w("StreamService", "applySenderBitrates: $kind encodings is empty; cannot apply")
+                    return
+                }
+
+                when (kind) {
+                    MediaStreamTrack.VIDEO_TRACK_KIND -> {
+                        val bps = (videoBitrateKbps.coerceAtLeast(1)) * 1000
+                        enc[0].maxBitrateBps = bps
+                        enc[0].minBitrateBps = bps
+                        enc[0].maxFramerate = videoFps.coerceAtLeast(1)
+                    }
+
+                    MediaStreamTrack.AUDIO_TRACK_KIND -> {
+                        val bps = (audioBitrateKbps.coerceAtLeast(6)) * 1000
+                        enc[0].maxBitrateBps = bps
+                        enc[0].minBitrateBps = bps
+                    }
+                }
+
+                sender.parameters = p
+                val a = sender.parameters.encodings?.firstOrNull()
+                Log.i(
+                    "StreamService",
+                    "applySenderBitrates: kind=$kind maxBitrateBps=${a?.maxBitrateBps} minBitrateBps=${a?.minBitrateBps} maxFramerate=${a?.maxFramerate}"
+                )
+            } catch (t: Throwable) {
+                Log.w("StreamService", "applySenderBitrates: failed for $kind", t)
+            }
+        }
+
+        pc.senders.forEach { sender ->
+            val kind = sender.track()?.kind() ?: return@forEach
+            if (kind == MediaStreamTrack.VIDEO_TRACK_KIND || kind == MediaStreamTrack.AUDIO_TRACK_KIND) {
+                applyToSender(sender, kind)
+            }
+        }
+    }
+
+    private fun mungeOpusMaxAverageBitrate(sdp: String, audioBitrateKbps: Int): String {
+        val bps = (audioBitrateKbps.coerceAtLeast(6)) * 1000
+        val lines = sdp.split("\r\n").toMutableList()
+
+        // Find opus payload type from rtpmap.
+        val rtpmapRegex = Regex("^a=rtpmap:(\\d+) opus/48000(?:/2)?$", RegexOption.IGNORE_CASE)
+        var opusPt: String? = null
+        for (l in lines) {
+            val m = rtpmapRegex.find(l.trim())
+            if (m != null) {
+                opusPt = m.groupValues[1]
+                break
+            }
+        }
+        if (opusPt == null) return sdp
+
+        val fmtpPrefix = "a=fmtp:$opusPt "
+        val fmtpIndex = lines.indexOfFirst { it.startsWith(fmtpPrefix) }
+        if (fmtpIndex >= 0) {
+            val cur = lines[fmtpIndex]
+            val params = cur.removePrefix(fmtpPrefix)
+            val kvs = params.split(";").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+            val filtered = kvs.filterNot { it.startsWith("maxaveragebitrate=", ignoreCase = true) }.toMutableList()
+            filtered.add("maxaveragebitrate=$bps")
+            lines[fmtpIndex] = fmtpPrefix + filtered.joinToString(";")
+        } else {
+            // Insert fmtp right after opus rtpmap line.
+            val rtpmapIndex = lines.indexOfFirst { it.trim().equals("a=rtpmap:$opusPt opus/48000", ignoreCase = true) || it.trim().equals("a=rtpmap:$opusPt opus/48000/2", ignoreCase = true) }
+            val insertAt = if (rtpmapIndex >= 0) rtpmapIndex + 1 else lines.size
+            lines.add(insertAt, fmtpPrefix + "maxaveragebitrate=$bps")
+        }
+
+        Log.i("StreamService", "SDP munged opus pt=$opusPt maxaveragebitrate=$bps")
+        return lines.joinToString("\r\n")
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -85,6 +171,11 @@ class StreamService : Service() {
         val videoHeight = intent.getIntExtra("videoHeight", 720)
         val videoFps = intent.getIntExtra("videoFps", 30)
         val videoBitrateKbps = intent.getIntExtra("videoBitrateKbps", 2500)
+
+        // Persist for later (we don't have an Activity intent field in Service)
+        currentVideoBitrateKbps = videoBitrateKbps
+        currentVideoFps = videoFps
+        currentAudioBitrateKbps = audioBitrateKbps
 
         if (resultCode == 0 || resultData == null || url.isNullOrEmpty()) {
             Log.e("StreamService", "Invalid intent extras")
@@ -376,44 +467,26 @@ class StreamService : Service() {
             null
         }
 
-        try {
-            val sender = videoTransceiver.sender
-            val params = sender.parameters
-            val encodings = params.encodings
-            if (!encodings.isNullOrEmpty()) {
-                encodings[0].maxBitrateBps = videoBitrateKbps * 1000
-                sender.parameters = params
-            }
-        } catch (t: Throwable) {
-            Log.w("StreamService", "Failed to set video bitrate", t)
-        }
-
-        if (audioTransceiver != null) {
-            try {
-                val sender = audioTransceiver.sender
-                val params = sender.parameters
-                val encodings = params.encodings
-                if (!encodings.isNullOrEmpty()) {
-                    encodings[0].maxBitrateBps = audioBitrateKbps * 1000
-                    sender.parameters = params
-                }
-            } catch (t: Throwable) {
-                Log.w("StreamService", "Failed to set audio bitrate", t)
-            }
-        }
+        // Apply bitrate caps immediately after tracks are attached.
+        // Some devices / WebRTC builds may override sender params during negotiation,
+        // so we re-apply again after local/remote descriptions are set.
+        applySenderBitrates(videoBitrateKbps, currentVideoFps, audioBitrateKbps)
 
         peerConnection!!.createOffer(object : SdpObserver {
             override fun onCreateSuccess(desc: SessionDescription?) {
                 desc?.let { offer ->
+                    val mungedSdp = mungeOpusMaxAverageBitrate(offer.description, currentAudioBitrateKbps)
+                    val mungedOffer = SessionDescription(offer.type, mungedSdp)
                     peerConnection!!.setLocalDescription(object : SdpObserver {
                         override fun onCreateSuccess(p0: SessionDescription?) {}
                         override fun onSetSuccess() {
+                            applySenderBitrates(videoBitrateKbps, currentVideoFps, audioBitrateKbps)
                             // After Setting Local Desc, Send to Server
-                            sendWhipOffer(whipUrl, token, offer.description)
+                            sendWhipOffer(whipUrl, token, mungedSdp)
                         }
                         override fun onCreateFailure(p0: String?) {}
                         override fun onSetFailure(p0: String?) {}
-                    }, offer)
+                    }, mungedOffer)
                 }
             }
             override fun onCreateFailure(p0: String?) {
@@ -483,6 +556,9 @@ class StreamService : Service() {
                 override fun onCreateSuccess(p0: SessionDescription?) {}
                 override fun onSetSuccess() {
                     Log.d("StreamService", "Remote Answer Set Successfully! Streaming should involve bytes now.")
+
+                    // Most reliable point to enforce sender bitrate caps.
+                    applySenderBitrates(currentVideoBitrateKbps, currentVideoFps, currentAudioBitrateKbps)
                 }
                 override fun onCreateFailure(p0: String?) {}
                 override fun onSetFailure(p0: String?) {
