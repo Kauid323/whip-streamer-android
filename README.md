@@ -15,6 +15,11 @@
 # screenshot
 ![image](https://github.com/user-attachments/assets/94008479-4dd5-436f-a135-cb5349f064de)
 
+![img](https://github.com/user-attachments/assets/dda68ad0-14e5-4306-8357-7f2bd6240a0a)
+
+![image](https://github.com/user-attachments/assets/4cbfb36f-8822-410f-a0ed-6a061be3a9e4)
+
+
 # 采集系统音频原理（Powered By AI）
 
 - 不用麦克风，而是用 Android 10+ 的 AudioPlaybackCapture 把“系统正在播放的声音”当成一个 AudioRecord 的输入源，然后把这路 PCM 音频喂给 WebRTC 的音频采集链路，最终编码成 Opus 走 WebRTC 发送。
@@ -31,4 +36,5 @@
 
 # 后记
 > 大概就是这样，由于webrtc编译需要下一堆依赖，下载过程中因为梯子不好总是断流，所以才想出了直接让ai反编译改现成的aar，然后再次编译回去，所以不需要再次编译。
+
 
