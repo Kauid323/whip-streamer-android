@@ -14,6 +14,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -21,6 +22,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -45,12 +47,18 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 fun MainScreen() {
     val context = LocalContext.current
     
     var streamUrl by remember { mutableStateOf("https://live-push.jwzhd.com/whip/") }
     var streamKey by remember { mutableStateOf("") }
     var audioSource by remember { mutableStateOf("mic") } // "mic" or "system" or "mix" or "none"
+
+    val videoCodecOptions = listOf("H264", "VP8", "VP9")
+    var selectedVideoCodec by remember { mutableStateOf("H264") }
+    val encoderModeOptions = listOf("Auto", "Hardware", "Software")
+    var selectedEncoderMode by remember { mutableStateOf("Auto") }
 
     var widthText by remember { mutableStateOf("1280") }
     var heightText by remember { mutableStateOf("720") }
@@ -78,6 +86,8 @@ fun MainScreen() {
                     putExtra("url", streamUrl.trim())
                     putExtra("token", streamKey.trim())
                     putExtra("audioSource", audioSource)
+                    putExtra("videoCodec", selectedVideoCodec)
+                    putExtra("videoEncoderMode", selectedEncoderMode)
                     putExtra("videoWidth", width)
                     putExtra("videoHeight", height)
                     putExtra("videoFps", fps)
@@ -156,13 +166,15 @@ fun MainScreen() {
                 value = fpsText,
                 onValueChange = { fpsText = it },
                 label = { Text("FPS") },
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.weight(1f),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
             )
             OutlinedTextField(
                 value = videoBitrateKbpsText,
                 onValueChange = { videoBitrateKbpsText = it },
                 label = { Text("Video Bitrate (kbps)") },
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.weight(1f),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
             )
         }
 
@@ -170,8 +182,63 @@ fun MainScreen() {
             value = audioBitrateKbpsText,
             onValueChange = { audioBitrateKbpsText = it },
             label = { Text("Audio Bitrate (kbps)") },
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
         )
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Video Codec", style = MaterialTheme.typography.titleMedium)
+
+                var codecExpanded by remember { mutableStateOf(false) }
+                ExposedDropdownMenuBox(expanded = codecExpanded, onExpandedChange = { codecExpanded = !codecExpanded }) {
+                    OutlinedTextField(
+                        value = selectedVideoCodec,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Codec") },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = codecExpanded) },
+                        modifier = Modifier.menuAnchor().fillMaxWidth()
+                    )
+                    ExposedDropdownMenu(expanded = codecExpanded, onDismissRequest = { codecExpanded = false }) {
+                        videoCodecOptions.forEach { opt ->
+                            DropdownMenuItem(
+                                text = { Text(opt) },
+                                onClick = {
+                                    selectedVideoCodec = opt
+                                    codecExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                Text("Encoder Mode", style = MaterialTheme.typography.titleMedium)
+
+                var modeExpanded by remember { mutableStateOf(false) }
+                ExposedDropdownMenuBox(expanded = modeExpanded, onExpandedChange = { modeExpanded = !modeExpanded }) {
+                    OutlinedTextField(
+                        value = selectedEncoderMode,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Mode") },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modeExpanded) },
+                        modifier = Modifier.menuAnchor().fillMaxWidth()
+                    )
+                    ExposedDropdownMenu(expanded = modeExpanded, onDismissRequest = { modeExpanded = false }) {
+                        encoderModeOptions.forEach { opt ->
+                            DropdownMenuItem(
+                                text = { Text(opt) },
+                                onClick = {
+                                    selectedEncoderMode = opt
+                                    modeExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
 
         OutlinedTextField(
             value = streamUrl,
@@ -213,7 +280,7 @@ fun MainScreen() {
                         enabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
                         onClick = { audioSource = "system" }
                     )
-                    Text("System Audio")
+                    Text("System Audio(Andorid 10+)")
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {

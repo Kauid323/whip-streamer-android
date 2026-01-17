@@ -52,6 +52,10 @@ class StreamService : Service() {
     private var currentVideoFps: Int = 30
     private var currentAudioBitrateKbps: Int = 64
 
+    private var currentVideoCodec: String = "H264"
+    private var currentVideoEncoderMode: String = "Auto"
+    private var currentVideoCodecStrict: Boolean = true
+
     private val systemAudioFactoryInvokedOnce = AtomicBoolean(false)
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
@@ -142,6 +146,170 @@ class StreamService : Service() {
         return lines.joinToString("\r\n")
     }
 
+    private fun mungePreferVideoCodec(sdp: String, preferredCodec: String): String {
+        val target = normalizePreferredVideoCodecOrNull(preferredCodec) ?: return sdp
+
+        val lines = sdp.split("\r\n").toMutableList()
+
+        // Find video m-section range.
+        val mVideo = lines.indexOfFirst { it.startsWith("m=video ") }
+        if (mVideo < 0) return sdp
+        val mNext = (mVideo + 1 until lines.size).firstOrNull { lines[it].startsWith("m=") } ?: lines.size
+
+        // Collect payload types for target codec within the video section.
+        val ptRegex = Regex("^a=rtpmap:(\\d+)\\s+([A-Za-z0-9]+)/", RegexOption.IGNORE_CASE)
+        val targetPts = mutableListOf<String>()
+        for (i in mVideo until mNext) {
+            val m = ptRegex.find(lines[i]) ?: continue
+            val pt = m.groupValues[1]
+            val codec = m.groupValues[2].uppercase()
+            if (codec == target) {
+                targetPts.add(pt)
+            }
+        }
+        if (targetPts.isEmpty()) {
+            Log.w("StreamService", "Preferred codec $target not present in offer SDP; leaving SDP unchanged")
+            return sdp
+        }
+
+        val parts = lines[mVideo].trim().split(" ")
+        if (parts.size < 4) return sdp
+        val header = parts.take(3)
+        val pts = parts.drop(3)
+
+        val reordered = buildList {
+            addAll(header)
+            addAll(pts.filter { it in targetPts })
+            addAll(pts.filterNot { it in targetPts })
+        }
+        lines[mVideo] = reordered.joinToString(" ")
+
+        Log.i("StreamService", "SDP munged video codec preferred=$target pts=${targetPts.joinToString(",")}")
+        return lines.joinToString("\r\n")
+    }
+
+    private fun normalizePreferredVideoCodecOrNull(preferredCodec: String): String? {
+        val normalized = preferredCodec.trim().uppercase()
+        return when (normalized) {
+            "H265", "HEVC" -> {
+                Log.w("StreamService", "Requested video codec $preferredCodec is not supported by this WebRTC build; falling back to H264")
+                "H264"
+            }
+
+            "H264", "VP8", "VP9" -> normalized
+            else -> {
+                Log.w("StreamService", "Unknown video codec '$preferredCodec'; falling back to H264")
+                "H264"
+            }
+        }
+    }
+
+    private class FilteringVideoEncoderFactory(
+        private val delegate: VideoEncoderFactory,
+        private val codecNameUpper: String
+    ) : VideoEncoderFactory {
+        override fun createEncoder(videoCodecInfo: VideoCodecInfo?): VideoEncoder? {
+            if (videoCodecInfo == null) return null
+            if (!videoCodecInfo.name.equals(codecNameUpper, ignoreCase = true)) return null
+            return delegate.createEncoder(videoCodecInfo)
+        }
+
+        override fun getSupportedCodecs(): Array<VideoCodecInfo> {
+            return delegate.supportedCodecs.filter { it.name.equals(codecNameUpper, ignoreCase = true) }.toTypedArray()
+        }
+    }
+
+    private class FilteringVideoDecoderFactory(
+        private val delegate: VideoDecoderFactory,
+        private val codecNameUpper: String
+    ) : VideoDecoderFactory {
+        override fun createDecoder(info: VideoCodecInfo?): VideoDecoder? {
+            if (info == null) return null
+            if (!info.name.equals(codecNameUpper, ignoreCase = true)) return null
+            return delegate.createDecoder(info)
+        }
+
+        override fun getSupportedCodecs(): Array<VideoCodecInfo> {
+            return delegate.supportedCodecs.filter { it.name.equals(codecNameUpper, ignoreCase = true) }.toTypedArray()
+        }
+    }
+
+    private fun logSdpVideoSection(tag: String, sdp: String) {
+        try {
+            val lines = sdp.split("\r\n")
+            val mVideo = lines.indexOfFirst { it.startsWith("m=video ") }
+            if (mVideo < 0) {
+                Log.i("StreamService", "$tag: no m=video section")
+                return
+            }
+            val mNext = (mVideo + 1 until lines.size).firstOrNull { lines[it].startsWith("m=") } ?: lines.size
+            val snippet = lines.subList(mVideo, mNext)
+                .filter { it.startsWith("m=video") || it.startsWith("a=rtpmap") || it.startsWith("a=fmtp") }
+                .joinToString(" | ")
+            Log.i("StreamService", "$tag: $snippet")
+        } catch (t: Throwable) {
+            Log.w("StreamService", "logSdpVideoSection failed", t)
+        }
+    }
+
+    private fun mungeRestrictVideoCodecIfPresent(sdp: String, preferredCodec: String): String {
+        val normalized = preferredCodec.trim().uppercase()
+        val target = when (normalized) {
+            "H265", "HEVC" -> "H264"
+            "H264", "VP8", "VP9" -> normalized
+            else -> "H264"
+        }
+
+        val lines = sdp.split("\r\n").toMutableList()
+        val mVideo = lines.indexOfFirst { it.startsWith("m=video ") }
+        if (mVideo < 0) return sdp
+        val mNext = (mVideo + 1 until lines.size).firstOrNull { lines[it].startsWith("m=") } ?: lines.size
+
+        val ptRegex = Regex("^a=rtpmap:(\\d+)\\s+([A-Za-z0-9]+)/", RegexOption.IGNORE_CASE)
+        val ptToCodec = mutableMapOf<String, String>()
+        for (i in mVideo until mNext) {
+            val m = ptRegex.find(lines[i]) ?: continue
+            ptToCodec[m.groupValues[1]] = m.groupValues[2].uppercase()
+        }
+
+        val mParts = lines[mVideo].trim().split(" ")
+        if (mParts.size < 4) return sdp
+        val header = mParts.take(3)
+        val pts = mParts.drop(3)
+
+        val targetPts = pts.filter { ptToCodec[it] == target }
+        if (targetPts.isEmpty()) {
+            Log.w("StreamService", "WHIP answer does not include preferred codec $target; cannot force. Using negotiated codec from server.")
+            return sdp
+        }
+
+        // Keep only preferred payload types in m=video line.
+        lines[mVideo] = (header + targetPts).joinToString(" ")
+        Log.i("StreamService", "SDP munged answer restrict video codec to $target pts=${targetPts.joinToString(",")}")
+
+        // Remove rtpmap/fmtp/rtcp-fb lines for payload types not in targetPts within video section.
+        val keepPts = targetPts.toSet()
+        val attrPtRegex = Regex("^a=(rtpmap|fmtp|rtcp-fb):(\\d+)\\b", RegexOption.IGNORE_CASE)
+        val newSection = mutableListOf<String>()
+        for (i in mVideo until mNext) {
+            val l = lines[i]
+            val m = attrPtRegex.find(l)
+            if (m != null) {
+                val pt = m.groupValues[2]
+                if (!keepPts.contains(pt)) {
+                    continue
+                }
+            }
+            newSection.add(l)
+        }
+        for (i in 0 until (mNext - mVideo)) {
+            lines.removeAt(mVideo)
+        }
+        lines.addAll(mVideo, newSection)
+
+        return lines.joinToString("\r\n")
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -167,6 +335,9 @@ class StreamService : Service() {
         val audioSrc = intent.getStringExtra("audioSource") ?: "mic"
         val audioBitrateKbps = intent.getIntExtra("audioBitrateKbps", 64)
 
+        val videoCodec = intent.getStringExtra("videoCodec") ?: "H264"
+        val videoEncoderMode = intent.getStringExtra("videoEncoderMode") ?: "Auto"
+
         val videoWidth = intent.getIntExtra("videoWidth", 1280)
         val videoHeight = intent.getIntExtra("videoHeight", 720)
         val videoFps = intent.getIntExtra("videoFps", 30)
@@ -176,6 +347,9 @@ class StreamService : Service() {
         currentVideoBitrateKbps = videoBitrateKbps
         currentVideoFps = videoFps
         currentAudioBitrateKbps = audioBitrateKbps
+
+        currentVideoCodec = videoCodec
+        currentVideoEncoderMode = videoEncoderMode
 
         if (resultCode == 0 || resultData == null || url.isNullOrEmpty()) {
             Log.e("StreamService", "Invalid intent extras")
@@ -305,15 +479,44 @@ class StreamService : Service() {
         eglBase = EglBase.create()
         
         val options = PeerConnectionFactory.Options()
-        val defaultVideoEncoderFactory = DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
-        val defaultVideoDecoderFactory = DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
+
+        val encoderMode = currentVideoEncoderMode
+        val baseVideoEncoderFactory: VideoEncoderFactory = when (encoderMode) {
+            "Hardware" -> HardwareVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
+            "Software" -> SoftwareVideoEncoderFactory()
+            else -> DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
+        }
+
+        val baseVideoDecoderFactory: VideoDecoderFactory = when (encoderMode) {
+            "Hardware" -> HardwareVideoDecoderFactory(eglBase!!.eglBaseContext)
+            "Software" -> SoftwareVideoDecoderFactory()
+            else -> DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
+        }
+
+        val normalizedCodec = normalizePreferredVideoCodecOrNull(currentVideoCodec)
+        val videoEncoderFactory: VideoEncoderFactory = if (currentVideoCodecStrict && normalizedCodec != null) {
+            FilteringVideoEncoderFactory(baseVideoEncoderFactory, normalizedCodec)
+        } else {
+            baseVideoEncoderFactory
+        }
+
+        val videoDecoderFactory: VideoDecoderFactory = if (currentVideoCodecStrict && normalizedCodec != null) {
+            FilteringVideoDecoderFactory(baseVideoDecoderFactory, normalizedCodec)
+        } else {
+            baseVideoDecoderFactory
+        }
+
+        Log.i(
+            "StreamService",
+            "Video encoder selection: codec=$currentVideoCodec strict=$currentVideoCodecStrict encoderMode=$currentVideoEncoderMode supportedEncoders=${videoEncoderFactory.supportedCodecs.joinToString { it.name }}"
+        )
 
         val audioDeviceModule = createAudioDeviceModuleOrNull(audioSrc, resultCode, resultData)
 
         val builder = PeerConnectionFactory.builder()
             .setOptions(options)
-            .setVideoEncoderFactory(defaultVideoEncoderFactory)
-            .setVideoDecoderFactory(defaultVideoDecoderFactory)
+            .setVideoEncoderFactory(videoEncoderFactory)
+            .setVideoDecoderFactory(videoDecoderFactory)
 
         if (audioDeviceModule != null) {
             builder.setAudioDeviceModule(audioDeviceModule)
@@ -475,7 +678,8 @@ class StreamService : Service() {
         peerConnection!!.createOffer(object : SdpObserver {
             override fun onCreateSuccess(desc: SessionDescription?) {
                 desc?.let { offer ->
-                    val mungedSdp = mungeOpusMaxAverageBitrate(offer.description, currentAudioBitrateKbps)
+                    val mungedOpus = mungeOpusMaxAverageBitrate(offer.description, currentAudioBitrateKbps)
+                    val mungedSdp = mungePreferVideoCodec(mungedOpus, currentVideoCodec)
                     val mungedOffer = SessionDescription(offer.type, mungedSdp)
                     peerConnection!!.setLocalDescription(object : SdpObserver {
                         override fun onCreateSuccess(p0: SessionDescription?) {}
@@ -528,6 +732,7 @@ class StreamService : Service() {
                 if (response.isSuccessful) {
                     val answerSdp = response.body?.string()
                     if (!answerSdp.isNullOrEmpty()) {
+                        logSdpVideoSection("WHIP answer (raw)", answerSdp)
                         setRemoteAnswer(answerSdp)
                     } else {
                         Log.e("StreamService", "Empty answer from WHIP server")
@@ -550,19 +755,35 @@ class StreamService : Service() {
     private fun setRemoteAnswer(sdp: String) {
         serviceScope.launch(Dispatchers.Main) {
             if (peerConnection == null) return@launch
-            
-            val answer = SessionDescription(SessionDescription.Type.ANSWER, sdp)
+
+            val target = normalizePreferredVideoCodecOrNull(currentVideoCodec)
+            if (currentVideoCodecStrict && target != null) {
+                val hasTarget = Regex("^a=rtpmap:(\\d+)\\s+$target/", setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE)).containsMatchIn(sdp)
+                if (!hasTarget) {
+                    Log.e("StreamService", "Strict codec=$target requested but WHIP answer doesn't include it. Failing fast.")
+                    stopStreaming()
+                    stopSelf()
+                    return@launch
+                }
+            }
+
+            val munged = mungeRestrictVideoCodecIfPresent(sdp, currentVideoCodec)
+            if (munged != sdp) {
+                logSdpVideoSection("WHIP answer (munged)", munged)
+            }
+
+            val answer = SessionDescription(SessionDescription.Type.ANSWER, munged)
             peerConnection?.setRemoteDescription(object : SdpObserver {
                 override fun onCreateSuccess(p0: SessionDescription?) {}
                 override fun onSetSuccess() {
                     Log.d("StreamService", "Remote Answer Set Successfully! Streaming should involve bytes now.")
-
-                    // Most reliable point to enforce sender bitrate caps.
                     applySenderBitrates(currentVideoBitrateKbps, currentVideoFps, currentAudioBitrateKbps)
                 }
                 override fun onCreateFailure(p0: String?) {}
                 override fun onSetFailure(p0: String?) {
-                     Log.e("StreamService", "Failed to set remote answer: $p0")
+                    Log.e("StreamService", "Failed to set remote answer: $p0")
+                    stopStreaming()
+                    stopSelf()
                 }
             }, answer)
         }
